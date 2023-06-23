@@ -1,4 +1,4 @@
-# openvpn-install (Ubuntu only)
+# openvpn-install (Native IPv6 for Ubuntu only)
 
 ![Test](https://github.com/angristan/openvpn-install/workflows/Test/badge.svg)
 ![Lint](https://github.com/angristan/openvpn-install/workflows/Lint/badge.svg)
