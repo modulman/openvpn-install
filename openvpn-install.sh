@@ -207,8 +207,8 @@ private-address: fe80::/10
 private-address: 127.0.0.0/8
 private-address: ::ffff:0:0/96' >/etc/unbound/openvpn.conf
 		if [[ $IPV6_SUPPORT == 'y' ]]; then
-			echo 'interface: fd42:42:42:42::1
-access-control: fd42:42:42:42::/112 allow' >>/etc/unbound/openvpn.conf
+			echo "interface: $IPv6prefix::1
+access-control: $IPv6prefix:80:81::/112 allow" >>/etc/unbound/openvpn.conf
 		fi
 	fi
 
@@ -269,8 +269,18 @@ function installQuestions() {
 	echo ""
 	# Ask the user if they want to enable IPv6 regardless its availability.
 	until [[ $IPV6_SUPPORT =~ (y|n) ]]; do
-		read -rp "Do you want to enable IPv6 support (NAT)? [y/n]: " -e -i $SUGGESTION IPV6_SUPPORT
+		read -rp "Do you want to enable IPv6 support (NATIVE)? [y/n]: " -e -i $SUGGESTION IPV6_SUPPORT
 	done
+	if [[ $IPV6_SUPPORT == 'y' ]]; then
+		apt-get install -y sipcalc
+		IPv6addr=$(ip -6 addr|awk '{print $2}'|grep -P '^(?!fe80)[[:alnum:]]{4}:.*/64')
+		IPv6prefix=$(sipcalc $IPv6addr | grep Subnet | cut -d '-' -f 2 | sed -ne 's/^ \([^ ]*\):0:0:0:0\/64$/\1/p')
+		if [[ -z $IPv6prefix ]]; then
+			echo ""
+			echo 'Prefix /64 for your network was not found, installation aborted!'
+			exit
+		fi
+	fi
 	echo ""
 	echo "What port do you want OpenVPN to listen to?"
 	echo "   1) Default: 1194"
@@ -643,8 +653,8 @@ function installOpenVPN() {
 
 	# Get the "public" interface from the default route
 	NIC=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
-	if [[ -z $NIC ]] && [[ $IPV6_SUPPORT == 'y' ]]; then
-		NIC=$(ip -6 route show default | sed -ne 's/^default .* dev \([^ ]*\) .*$/\1/p')
+	if [[ $IPV6_SUPPORT == 'y' ]]; then
+		NICv6=$(ip -6 route show default | sed -ne '1,2s/^.*\(default|nexthop\)\? .* dev \([^ ]*\) .*$/\2/p')
 	fi
 
 	# $NIC can not be empty for script rm-openvpn-rules.sh
@@ -666,7 +676,7 @@ function installOpenVPN() {
 	if [[ ! -e /etc/openvpn/server.conf ]]; then
 		if [[ $OS =~ (debian|ubuntu) ]]; then
 			apt-get update
-			apt-get -y install ca-certificates gnupg
+			apt-get install -y ca-certificates gnupg
 			# We add the OpenVPN repo to get the latest version.
 			if [[ $VERSION_ID == "16.04" ]]; then
 				echo "deb http://build.openvpn.net/debian/openvpn/stable xenial main" >/etc/apt/sources.list.d/openvpn.list
@@ -776,8 +786,8 @@ function installOpenVPN() {
 	fi
 
 	echo "dev tun
-user nobody
-group $NOGROUP
+user vpn
+group vpn
 persist-key
 persist-tun
 keepalive 10 120
@@ -798,7 +808,7 @@ ifconfig-pool-persist ipp.txt" >>/etc/openvpn/server.conf
 		# Obtain the resolvers from resolv.conf and use them for OpenVPN
 		sed -ne 's/^nameserver[[:space:]]\+\([^[:space:]]\+\).*$/\1/p' $RESOLVCONF | while read -r line; do
 			# Copy, if it's a IPv4 |or| if IPv6 is enabled, IPv4/IPv6 does not matter
-			if [[ $line =~ ^[0-9.]*$ ]] || [[ $IPV6_SUPPORT == 'y' ]]; then
+			if [[ $line =~ ^[0-9.]*$ ]] || [[ c == 'y' ]]; then
 				echo "push \"dhcp-option DNS $line\"" >>/etc/openvpn/server.conf
 			fi
 		done
@@ -806,7 +816,7 @@ ifconfig-pool-persist ipp.txt" >>/etc/openvpn/server.conf
 	2) # Self-hosted DNS resolver (Unbound)
 		echo 'push "dhcp-option DNS 10.8.0.1"' >>/etc/openvpn/server.conf
 		if [[ $IPV6_SUPPORT == 'y' ]]; then
-			echo 'push "dhcp-option DNS fd42:42:42:42::1"' >>/etc/openvpn/server.conf
+			echo 'push "dhcp-option DNS '$IPv6prefix':80:81::1"' >>/etc/openvpn/server.conf
 		fi
 		;;
 	3) # Cloudflare
@@ -860,11 +870,12 @@ ifconfig-pool-persist ipp.txt" >>/etc/openvpn/server.conf
 
 	# IPv6 network settings if needed
 	if [[ $IPV6_SUPPORT == 'y' ]]; then
-		echo 'server-ipv6 fd42:42:42:42::/112
+		echo 'server-ipv6 '$IPv6prefix':80:81::/112
 tun-ipv6
 push tun-ipv6
 push "route-ipv6 2000::/3"
-push "redirect-gateway ipv6"' >>/etc/openvpn/server.conf
+push "redirect-gateway ipv6"
+learn-address "/usr/bin/sudo -u root /etc/openvpn/learn-address.sh"' >>/etc/openvpn/server.conf
 	fi
 
 	if [[ $COMPRESSION_ENABLED == "y" ]]; then
@@ -909,7 +920,26 @@ verb 3" >>/etc/openvpn/server.conf
 	# Enable routing
 	echo 'net.ipv4.ip_forward=1' >/etc/sysctl.d/99-openvpn.conf
 	if [[ $IPV6_SUPPORT == 'y' ]]; then
-		echo 'net.ipv6.conf.all.forwarding=1' >>/etc/sysctl.d/99-openvpn.conf
+		useradd vpn
+		bash -c 'echo "Defaults:vpn env_keep += \"ifconfig_pool_remote_ip common_name\"
+vpn ALL=NOPASSWD: /etc/openvpn/learn-address.sh" >> /etc/sudoers.d/99-openvpn'
+
+echo 'net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.all.proxy_ndp=1' >>/etc/sysctl.d/99-openvpn.conf
+
+echo '#!/bin/sh
+action="$1"
+addr="$2"
+case "$action" in
+	add | update)
+		ip neigh replace proxy "$addr" dev '$NICv6'
+		;;
+	delete)
+		ip neigh del proxy "$addr" dev '$NICv6'
+		;;
+esac'	>>/etc/openvpn/learn-address.sh
+		chmod +x /etc/openvpn/learn-address.sh
+
 	fi
 	# Apply sysctl rules
 	sysctl --system
@@ -970,14 +1000,6 @@ iptables -I FORWARD 1 -i $NIC -o tun0 -j ACCEPT
 iptables -I FORWARD 1 -i tun0 -o $NIC -j ACCEPT
 iptables -I INPUT 1 -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >/etc/iptables/add-openvpn-rules.sh
 
-	if [[ $IPV6_SUPPORT == 'y' ]]; then
-		echo "ip6tables -t nat -I POSTROUTING 1 -s fd42:42:42:42::/112 -o $NIC -j MASQUERADE
-ip6tables -I INPUT 1 -i tun0 -j ACCEPT
-ip6tables -I FORWARD 1 -i $NIC -o tun0 -j ACCEPT
-ip6tables -I FORWARD 1 -i tun0 -o $NIC -j ACCEPT
-ip6tables -I INPUT 1 -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/add-openvpn-rules.sh
-	fi
-
 	# Script to remove rules
 	echo "#!/bin/sh
 iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o $NIC -j MASQUERADE
@@ -985,14 +1007,6 @@ iptables -D INPUT -i tun0 -j ACCEPT
 iptables -D FORWARD -i $NIC -o tun0 -j ACCEPT
 iptables -D FORWARD -i tun0 -o $NIC -j ACCEPT
 iptables -D INPUT -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >/etc/iptables/rm-openvpn-rules.sh
-
-	if [[ $IPV6_SUPPORT == 'y' ]]; then
-		echo "ip6tables -t nat -D POSTROUTING -s fd42:42:42:42::/112 -o $NIC -j MASQUERADE
-ip6tables -D INPUT -i tun0 -j ACCEPT
-ip6tables -D FORWARD -i $NIC -o tun0 -j ACCEPT
-ip6tables -D FORWARD -i tun0 -o $NIC -j ACCEPT
-ip6tables -D INPUT -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/rm-openvpn-rules.sh
-	fi
 
 	chmod +x /etc/iptables/add-openvpn-rules.sh
 	chmod +x /etc/iptables/rm-openvpn-rules.sh
@@ -1269,17 +1283,17 @@ function removeOpenVPN() {
 		fi
 
 		if [[ $OS =~ (debian|ubuntu) ]]; then
-			apt-get remove --purge -y openvpn
+			apt-get remove --purge -y openvpn sipcalc
 			if [[ -e /etc/apt/sources.list.d/openvpn.list ]]; then
 				rm /etc/apt/sources.list.d/openvpn.list
 				apt-get update
 			fi
 		elif [[ $OS == 'arch' ]]; then
-			pacman --noconfirm -R openvpn
+			pacman --noconfirm -R openvpn sipcalc
 		elif [[ $OS =~ (centos|amzn|oracle) ]]; then
-			yum remove -y openvpn
+			yum remove -y openvpn sipcalc
 		elif [[ $OS == 'fedora' ]]; then
-			dnf remove -y openvpn
+			dnf remove -y openvpn sipcalc
 		fi
 
 		# Cleanup
@@ -1288,7 +1302,9 @@ function removeOpenVPN() {
 		rm -rf /etc/openvpn
 		rm -rf /usr/share/doc/openvpn*
 		rm -f /etc/sysctl.d/99-openvpn.conf
+		rm -f /etc/sudoers.d/99-openvpn
 		rm -rf /var/log/openvpn
+		userdel vpn
 
 		# Unbound
 		if [[ -e /etc/unbound/openvpn.conf ]]; then
